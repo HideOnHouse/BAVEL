@@ -68,18 +68,25 @@ class Pipeline(QObject):
         cfg = config.config
 
         self._capture: AudioCapture | None = None
-        self._stream = AudioStream()
-        self._vad = VoiceActivityDetector()
+        self._stream = AudioStream(settings=cfg.audio)
+        self._vad = VoiceActivityDetector(
+            settings=cfg.vad,
+            sample_rate=cfg.audio.sample_rate,
+        )
         self._transcriber = RealtimeTranscriber(
             model_size=cfg.stt_model,
             language=cfg.source_language if cfg.source_language != "auto" else None,
+            settings=cfg.stt,
         )
-        self._diarizer = RealtimeDiarizer()
+        self._diarizer = RealtimeDiarizer(settings=cfg.diarization)
         self._translator = Translator(
-            api_url=cfg.lm_studio_url,
-            model=cfg.lm_studio_model,
+            api_url=cfg.translation_api_url,
+            model=cfg.translation_model,
             source_lang=cfg.source_language,
             target_lang=cfg.target_language,
+            provider=cfg.translation_provider,
+            api_key=cfg.translation_api_key,
+            settings=cfg.translation,
         )
 
         self._latest_speaker: DiarizationResult | None = None
@@ -92,13 +99,16 @@ class Pipeline(QObject):
         self._stream.add_consumer(self._vad.process_chunk)
         self._vad.set_speech_callback(self._on_speech)
         self._transcriber.set_callback(self._on_transcription)
+        # Diarizer receives audio only AFTER transcriber confirms valid speech
+        # (language probability >= threshold). This prevents noise/music from
+        # creating spurious speaker labels.
+        self._transcriber.set_audio_validated_callback(self._diarizer.feed_audio)
         self._diarizer.set_callback(self._on_diarization)
         self._diarizer.set_new_speaker_callback(self._on_new_speaker)
         self._translator.set_callback(self._on_translation)
 
     def _on_speech(self, audio, sr) -> None:
         self._transcriber.feed_audio(audio, sr)
-        self._diarizer.feed_audio(audio, sr)
 
     def _on_transcription(self, segment: TranscriptionSegment) -> None:
         if self._paused:
@@ -107,7 +117,7 @@ class Pipeline(QObject):
         speaker_label = speaker.speaker_label if speaker else "Speaker 1"
         speaker_id = speaker.speaker_id if speaker else 1
 
-        self._translator.translate(segment.text, speaker_label)
+        self._translator.translate(segment.text, speaker_label, speaker_id)
 
     def _on_diarization(self, result: DiarizationResult) -> None:
         self._latest_speaker = result
@@ -118,17 +128,20 @@ class Pipeline(QObject):
     def _on_translation(self, result: TranslationResult) -> None:
         if self._paused:
             return
-        parts = result.original.split(": ", 1)
-        speaker_label = parts[0] if len(parts) > 1 else "Speaker 1"
-        original_text = parts[1] if len(parts) > 1 else result.original
 
-        speaker = self._latest_speaker
-        speaker_id = speaker.speaker_id if speaker and speaker.speaker_label == speaker_label else 1
+        speaker_label = result.speaker_label or "Speaker 1"
+        speaker_id = result.speaker_id
 
-        # If translated == original (no LM Studio), only show original
-        translated = result.translated
-        translated_parts = translated.split(": ", 1)
-        translated_text = translated_parts[1] if len(translated_parts) > 1 else translated
+        # Strip "Speaker N: " prefix from the text if present
+        original_text = result.original
+        parts = original_text.split(": ", 1)
+        if len(parts) > 1:
+            original_text = parts[1]
+
+        translated_text = result.translated
+        t_parts = translated_text.split(": ", 1)
+        if len(t_parts) > 1:
+            translated_text = t_parts[1]
 
         self.subtitle_ready.emit(translated_text, original_text, speaker_label, speaker_id)
 
@@ -191,6 +204,10 @@ class Pipeline(QObject):
         self._diarizer.reset_speakers()
         self._latest_speaker = None
 
+    def change_provider(self, provider: str, api_key: str, model: str) -> None:
+        self._translator.set_provider(provider, api_key, model)
+        self.check_lm_connection()
+
     def set_languages(self, source: str, target: str) -> None:
         lang = source if source != "auto" else None
         self._transcriber.set_language(lang)
@@ -204,12 +221,19 @@ class Pipeline(QObject):
 
         async def _check():
             connected = await self._translator.check_connection()
-            model = self._config.config.lm_studio_model
+            model = self._config.config.translation_model
             self.lm_status_changed.emit(connected, model)
 
         loop = self._translator._loop
         if loop and loop.is_running():
             asyncio.run_coroutine_threadsafe(_check(), loop)
+        else:
+            # Start a temporary loop for the check
+            def _sync_check():
+                result = asyncio.run(self._translator.check_connection())
+                model = self._config.config.translation_model
+                self.lm_status_changed.emit(result, model)
+            threading.Thread(target=_sync_check, daemon=True).start()
 
 
 class App:
@@ -242,6 +266,7 @@ class App:
         mw.language_changed.connect(self._pipeline.set_languages)
         mw.model_changed.connect(self._pipeline.change_model)
         mw.speaker_reset_requested.connect(self._pipeline.reset_speakers)
+        mw.provider_changed.connect(self._pipeline.change_provider)
 
         pipe = self._pipeline
         pipe.subtitle_ready.connect(self._overlay.add_subtitle)

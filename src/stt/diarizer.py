@@ -10,6 +10,8 @@ from typing import Callable
 
 import numpy as np
 
+from src.core.config import DiarizationSettings
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16_000
@@ -36,8 +38,10 @@ class RealtimeDiarizer:
     the diart ``SpeakerDiarization`` pipeline one at a time.
     """
 
-    def __init__(self, max_speakers: int = 8) -> None:
-        self._max_speakers = max_speakers
+    def __init__(self, settings: DiarizationSettings | None = None) -> None:
+        self._settings = settings or DiarizationSettings()
+        self._max_speakers = self._settings.max_speakers
+        self._min_seg_dur = self._settings.min_segment_duration
         self._pipeline = None
         self._config = None
         self._callback: DiarizationCallback | None = None
@@ -59,11 +63,12 @@ class RealtimeDiarizer:
     def load_pipeline(self) -> None:
         from diart.blocks.diarization import SpeakerDiarization, SpeakerDiarizationConfig
 
+        s = self._settings
         self._config = SpeakerDiarizationConfig(
-            max_speakers=self._max_speakers,
-            tau_active=0.55,
-            rho_update=0.4,
-            delta_new=1.9,
+            max_speakers=s.max_speakers,
+            tau_active=s.tau_active,
+            rho_update=s.rho_update,
+            delta_new=s.delta_new,
         )
         self._pipeline = SpeakerDiarization(self._config)
         self._chunk_duration = self._config.duration
@@ -135,24 +140,33 @@ class RealtimeDiarizer:
 
             outputs = self._pipeline([swf])
 
+            best_segment = None
+            best_duration = 0.0
+
             for annotation, _agg_waveform in outputs:
                 for segment, _track, label in annotation.itertracks(yield_label=True):
+                    duration = segment.end - segment.start
+                    if duration < self._min_seg_dur:
+                        continue
                     speaker_num = self._resolve_speaker(label)
                     is_new = speaker_num not in self._known_speakers
                     if is_new:
                         self._register_new_speaker(speaker_num)
 
-                    result = DiarizationResult(
-                        speaker_id=speaker_num,
-                        speaker_label=self._speaker_labels.get(
-                            speaker_num, f"Speaker {speaker_num}"
-                        ),
-                        start=segment.start,
-                        end=segment.end,
-                        is_new_speaker=is_new,
-                    )
-                    if self._callback:
-                        self._callback(result)
+                    if duration > best_duration:
+                        best_duration = duration
+                        best_segment = DiarizationResult(
+                            speaker_id=speaker_num,
+                            speaker_label=self._speaker_labels.get(
+                                speaker_num, f"Speaker {speaker_num}"
+                            ),
+                            start=segment.start,
+                            end=segment.end,
+                            is_new_speaker=is_new,
+                        )
+
+            if best_segment and self._callback:
+                self._callback(best_segment)
 
             self._time_offset += self._chunk_duration
         except Exception as exc:

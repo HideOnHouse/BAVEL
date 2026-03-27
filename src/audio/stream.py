@@ -10,11 +10,9 @@ from typing import Callable
 import numpy as np
 from scipy import signal as scipy_signal
 
-logger = logging.getLogger(__name__)
+from src.core.config import AudioSettings
 
-TARGET_SAMPLE_RATE = 16_000
-CHUNK_DURATION_SEC = 3.0
-HOP_DURATION_SEC = 1.5
+logger = logging.getLogger(__name__)
 
 
 class AudioStream:
@@ -23,14 +21,13 @@ class AudioStream:
 
     def __init__(
         self,
+        settings: AudioSettings | None = None,
         source_sample_rate: int = 48_000,
-        chunk_duration: float = CHUNK_DURATION_SEC,
-        hop_duration: float = HOP_DURATION_SEC,
     ) -> None:
+        s = settings or AudioSettings()
         self._source_sr = source_sample_rate
-        self._target_sr = TARGET_SAMPLE_RATE
-        self._chunk_samples = int(self._target_sr * chunk_duration)
-        self._hop_samples = int(self._target_sr * hop_duration)
+        self._target_sr = s.sample_rate
+        self._chunk_samples = int(self._target_sr * s.chunk_duration)
 
         self._buffer: deque[np.ndarray] = deque()
         self._buffer_samples = 0
@@ -57,6 +54,8 @@ class AudioStream:
         audio = audio.astype(np.float32)
         if self._source_sr != self._target_sr:
             num_samples = int(len(audio) * self._target_sr / self._source_sr)
+            if num_samples < 1:
+                return
             audio = scipy_signal.resample(audio, num_samples).astype(np.float32)
 
         with self._lock:
@@ -94,15 +93,6 @@ class AudioStream:
                     self._buffer[0] = segment[needed:]
                     self._buffer_samples -= needed
                     collected += needed
-
-            # Advance by hop, not full chunk (sliding window)
-            discard = self._hop_samples
-            remaining = self._chunk_samples - self._hop_samples
-            if remaining > 0:
-                chunk_data = np.concatenate(parts)
-                overlap = chunk_data[discard:]
-                self._buffer.appendleft(overlap)
-                self._buffer_samples += len(overlap)
 
             return np.concatenate(parts) if parts else None
 

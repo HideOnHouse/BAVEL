@@ -10,12 +10,11 @@ from typing import Callable
 
 import numpy as np
 
+from src.core.config import STTSettings
+
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16_000
-
-
-MIN_LANGUAGE_PROBABILITY = 0.8
 
 
 @dataclass
@@ -44,13 +43,18 @@ class RealtimeTranscriber:
         language: str | None = None,
         device: str = "auto",
         compute_type: str = "auto",
+        settings: STTSettings | None = None,
     ) -> None:
+        s = settings or STTSettings()
         self._model_size = model_size
         self._language = language
         self._device = device
         self._compute_type = compute_type
+        self._min_lang_prob = s.min_language_probability
+        self._beam_size = s.beam_size
         self._model = None
         self._callback: TranscriptionCallback | None = None
+        self._audio_validated_callback: Callable[[np.ndarray, int], None] | None = None
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._running = False
@@ -118,6 +122,14 @@ class RealtimeTranscriber:
     def set_callback(self, callback: TranscriptionCallback) -> None:
         self._callback = callback
 
+    def set_audio_validated_callback(
+        self, callback: Callable[[np.ndarray, int], None],
+    ) -> None:
+        """Register a callback that fires once per audio chunk that passes
+        the language-probability gate.  Used to feed only validated speech
+        to the diarizer (instead of raw VAD output that may contain noise)."""
+        self._audio_validated_callback = callback
+
     def start(self) -> None:
         if self._running:
             return
@@ -158,18 +170,25 @@ class RealtimeTranscriber:
             segments, info = self._model.transcribe(
                 audio,
                 language=self._language,
-                beam_size=5,
+                beam_size=self._beam_size,
                 vad_filter=False,
             )
 
             lang_prob = info.language_probability
-            if lang_prob < MIN_LANGUAGE_PROBABILITY:
+            if lang_prob < self._min_lang_prob:
                 logger.info(
                     "STT: language '%s' prob %.2f < %.2f, skipping",
-                    info.language, lang_prob, MIN_LANGUAGE_PROBABILITY,
+                    info.language, lang_prob, self._min_lang_prob,
                 )
                 self._time_offset += len(audio) / SAMPLE_RATE
                 return
+
+            # Audio confirmed as valid speech → forward to diarizer
+            if self._audio_validated_callback:
+                try:
+                    self._audio_validated_callback(audio, SAMPLE_RATE)
+                except Exception as exc:
+                    logger.error("Audio validated callback error: %s", exc)
 
             for seg in segments:
                 text = seg.text.strip()

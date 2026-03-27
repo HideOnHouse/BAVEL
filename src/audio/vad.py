@@ -12,40 +12,42 @@ from typing import Callable
 import numpy as np
 import torch
 
+from src.core.config import VADSettings
+
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16_000
-VAD_FRAME_SAMPLES = 512  # Silero requires exactly 512 samples at 16 kHz
-
-SPEECH_THRESHOLD = 0.5
-ONSET_FRAMES = 2         # consecutive speech frames to confirm onset
-OFFSET_FRAMES = 15       # consecutive silence frames to confirm offset (~480 ms)
-PRE_ROLL_FRAMES = 3      # include N frames before onset for context
-MIN_UTTERANCE_SEC = 0.5
-MAX_UTTERANCE_SEC = 15.0
+# Silero requires exactly 512 samples per frame at 16 kHz (= 32 ms)
+VAD_FRAME_SAMPLES = 512
 
 
 class VoiceActivityDetector:
     """Detects utterance boundaries in a continuous audio stream.
 
     Accumulates audio while speech is active and dispatches complete
-    utterances (speech-start → speech-end) via the speech callback.
+    utterances (speech-start -> speech-end) via the speech callback.
     """
 
     def __init__(
         self,
-        threshold: float = SPEECH_THRESHOLD,
-        sample_rate: int = SAMPLE_RATE,
+        settings: VADSettings | None = None,
+        sample_rate: int = 16_000,
     ) -> None:
-        self._threshold = threshold
+        s = settings or VADSettings()
+        self._threshold = s.speech_threshold
+        self._onset_frames = s.onset_frames
+        self._offset_frames = s.offset_frames
+        self._pre_roll_frames = s.pre_roll_frames
+        self._min_utterance_sec = s.min_utterance_sec
+        self._max_utterance_sec = s.max_utterance_sec
         self._sample_rate = sample_rate
+
         self._model = None
         self._speech_callback: Callable[[np.ndarray, int], None] | None = None
 
         # State machine
         self._is_speaking = False
-        self._speech_count = 0      # consecutive speech frames
-        self._silence_count = 0     # consecutive silence frames
+        self._speech_count = 0
+        self._silence_count = 0
 
         # Buffers
         self._utterance_buf: list[np.ndarray] = []
@@ -87,12 +89,12 @@ class VoiceActivityDetector:
         if not self._is_speaking:
             # --- waiting for speech onset ---
             self._pre_roll.append(frame)
-            if len(self._pre_roll) > PRE_ROLL_FRAMES:
+            if len(self._pre_roll) > self._pre_roll_frames:
                 self._pre_roll.pop(0)
 
             if is_speech:
                 self._speech_count += 1
-                if self._speech_count >= ONSET_FRAMES:
+                if self._speech_count >= self._onset_frames:
                     self._begin_utterance()
             else:
                 self._speech_count = 0
@@ -105,18 +107,16 @@ class VoiceActivityDetector:
                 self._silence_count = 0
             else:
                 self._silence_count += 1
-                if self._silence_count >= OFFSET_FRAMES:
+                if self._silence_count >= self._offset_frames:
                     self._end_utterance()
                     return
 
-            # Force-flush very long utterances to keep latency bounded
-            if self._utterance_samples / self._sample_rate >= MAX_UTTERANCE_SEC:
+            if self._utterance_samples / self._sample_rate >= self._max_utterance_sec:
                 self._end_utterance()
 
     def _begin_utterance(self) -> None:
         self._is_speaking = True
         self._silence_count = 0
-        # Prepend the pre-roll for context
         self._utterance_buf = list(self._pre_roll)
         self._utterance_samples = sum(len(f) for f in self._utterance_buf)
         self._pre_roll.clear()
@@ -127,7 +127,7 @@ class VoiceActivityDetector:
         self._speech_count = 0
         self._silence_count = 0
 
-        if self._utterance_samples / self._sample_rate < MIN_UTTERANCE_SEC:
+        if self._utterance_samples / self._sample_rate < self._min_utterance_sec:
             self._utterance_buf.clear()
             self._utterance_samples = 0
             return
